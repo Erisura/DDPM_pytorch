@@ -93,10 +93,36 @@ class ResnetBlock(nn.Module):
 
         return h + self.res_conv(x)
 
-"""
-    class ConvNeXtBlock(nn.Module):
-        pass
-"""
+class ConvNeXtBlock(nn.Module):
+    def __init__(self, dim, dim_out, *,time_embed_dim=None, mult=2, norm=True):
+        super().__init__()
+        self.mlp=(
+            nn.Sequential(nn.GELU(), nn.Linear(time_embed_dim, dim))
+            if time_embed_dim is not None
+            else None
+        )
+        # depth-wise conv
+        self.ds_conv = nn.Conv2d(dim, dim, 7, padding=3, groups=dim)
+
+        self.net = nn.Sequential(
+            nn.GroupNorm(1,dim) if norm else nn.Identity(),
+            nn.Conv2d(dim, dim_out * mult, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.GroupNorm(1, dim_out * mult),
+            nn.Conv2d(dim_out * mult, dim_out,kernal_size=3,padding=1),
+        )
+        self.res_conv = nn.Conv2d(dim, dim_out, kernel_size=1) if not dim==dim_out else nn.Identity()
+    
+    def forward(self, x, time_embed=None):
+        h = self.ds_conv(x)
+
+        if self.mlp is not None and time_embed is not None:
+            condition = self.mlp(time_embed)
+            h = h + condition[:,:,None,None]
+        
+        h = self.net(h)
+        return h + self.res_conv(x)
+
 
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=4, dim_per_head=32):
@@ -150,7 +176,7 @@ class LinearAttention(nn.Module):
 
         q = q * self.scale
 
-        # 这里采取不同的处理复杂度会不同,主要的复杂度在最后一维
+        # 这里采取不同的处理复杂度会不同,主要的复杂度在最后一个维度
         context = einsum(" b h d n, b h e n -> b h d e",k,v)
         
         out = einsum("b h d n, b h d e -> b h e n", q,context)
@@ -158,10 +184,107 @@ class LinearAttention(nn.Module):
         return self.to_out
 
 class PreNorm(nn.Module):
-    def __init__(self, fn ,dim):
+    def __init__(self, dim ,fn):
+        super().__init__()
         self.fn = fn
         self.norm = nn.LayerNorm(dim)
     
     def forward(self, x, **kwargs):
         return self.fn(self.norm(x), **kwargs)
-    
+
+"""
+    首先，对噪声图像进行卷积处理，对噪声水平进行进行位置编码（embedding）
+    然后，进入一个序列的下采样阶段，每个下采样阶段由两个ResNet/ConvNeXT模块+分组归一化+注意力模块+残差链接+下采样完成。
+    在网络的中间层，再一次用ResNet/ConvNeXT模块，中间穿插着注意力模块(Attention)。
+    下一个阶段，则是序列构成的上采样阶段，每个上采样阶段由两个ResNet/ConvNeXT模块+分组归一化+注意力模块+残差链接+上采样完成。
+    最后，一个ResNet/ConvNeXT模块后面跟着一个卷积层。
+"""
+class UNet(nn.Module):
+    def __init__(
+        self,
+        dim,
+        init_dim=None,
+        out_dim=None,
+        dim_mults=(1,2,4,8),
+        channels=3,
+        with_time_embed=True,
+        resnet_block_groups=8,
+        use_convnext=True,
+        convnext_mult=2,
+    ):
+        super().__init__()
+        self.channels = channels
+        
+        #为什么默认的init_dim是 dim//3*2
+        init_dim = default(init_dim, dim//3*2)
+        
+        self.init_conv = nn.Conv2d(channels, init_dim, kernel_size=7, padding=3)
+
+        dims = [init_dim, *map(lambda t: dim*t, dim_mults)]
+        
+        # 巧妙地将dim序列打包成 等同于in = dim[k], out = dim[k+1]
+        in_out = list(zip(dims[:-1],dim[1:]))
+
+        if use_convnext:
+            block_klass = partial(ConvNeXtBlock,mult=convnext_mult)
+        else:
+            block_klass = partial(ResnetBlock, num_groups=resnet_block_groups)
+        
+        # time embeddings
+        # 这里的dimension设计是为什么
+        if with_time_embed:
+            time_dim = dim*4
+            self.time_mlp = nn.Sequential(
+                SinusoidalPositionEmbedding(dim),
+                nn.Linear(dim, time_dim),
+                nn.GELU(),
+                nn.Linear(time_dim, time_dim),
+            )
+        else:
+            time_dim = None
+            self.time_mlp = None
+        
+        # layers
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+
+        # 定义UNet下采样部分
+        for idx, (dim_in, dim_out) in enumerate(in_out):
+            is_last = idx == len(in_out-1)
+
+            self.downs.append(
+                nn.ModuleList([
+                    block_klass(dim_in, dim_out, time_embed_dim=time_dim),
+                    block_klass(dim_out,dim_out, time_embed_dim=time_dim),
+                    Residual(PreNorm(dim_out,LinearAttention(dim_out))),
+                    Downsample(dim_out) if not is_last else nn.Identity(),
+                ])
+            )
+
+        # 定义中间部分
+        mid_dim = dims[-1]
+        self.mid_block1 = block_klass(mid_dim, mid_dim, time_embed_dim=time_dim)
+        self.mid_atten = Residual(PreNorm(mid_dim, Attention(mid_dim))) # 这里为何选择这个 不用Linear Attention
+        self.mid_block2 = block_klass(mid_dim, mid_dim, time_embed_dim=time_dim)
+
+        # 定义UNet上采样部分
+        for idx,(dim_in, dim_out) in enumerate(reversed(in_out[1:])): # 最后一层做特殊处理，所以从1开始
+            is_last = idx == len(in_out)-1
+            
+            self.ups.append(
+                nn.ModuleList([
+                    block_klass(dim_out*2, dim_in, time_embed_dim=time_dim), #dim_out为什么乘以2
+                    block_klass(dim_in, dim_in,time_embed_dim=time_dim),
+                    Residual(PreNorm(dim_in,LinearAttention(dim_in))),
+                    Upsample(dim_in) if not is_last else nn.Identity(),
+                ])
+            )
+
+        out_dim = default(out_dim, channels)
+        self.final_conv = nn.Sequential(
+            block_klass(dim, dim),
+            nn.Conv2d(dim, out_dim, 1)
+        )
+    def forward(self, x, time):
+        
+            
