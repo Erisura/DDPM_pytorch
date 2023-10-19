@@ -104,15 +104,64 @@ class Attention(nn.Module):
         self.scale = dim_per_head ** -0.5
         self.num_heads = num_heads
         hidden_dim = num_heads * dim_per_head
-        self.to_qkv = nn.Conv2d(dim, hidden_dim*3, kernel_size=3, padding=1, bias=False)
+        self.to_qkv = nn.Conv2d(dim, hidden_dim*3, kernel_size=1, bias=False)
         self.to_out = nn.Conv2d(hidden_dim, dim, kernel_size=1)
 
     def forward(self,x):
         b,c,h,w = x.shape
         qkv = self.to_qkv(x).chunk(3, dim=1)
         q,k,v = map(
-            lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h=self.num_heads), qkv
+            lambda t: rearrange(t, 'b (h d) x y -> b h d (x y)', h=self.num_heads), qkv
         )
         q = q * self.scale
-        sim = einsum("b h d i, b h d j -> b h i j",q,k)
         
+        sim = einsum("b h d i, b h d j -> b h i j",q,k)
+        sim = sim - sim.amax(dim=-1, keepdim=True).detach()
+        atten = sim.softmax(dim=-1)
+
+        out = einsum("b h i j, b h d j -> b h i d", atten, v)
+        out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h,y=w)
+        
+        return self.to_out(out)
+    
+class LinearAttention(nn.Module):
+    def __init__(self, dim, num_heads=4, dim_per_head=32):
+        super().__init__()
+        self.scale = dim_per_head ** -0.5
+        self.num_heads = num_heads
+        hidden_dim = num_heads*dim_per_head
+        
+        self.to_qkv = nn.Conv2d(dim, hidden_dim*3, kernel_size=1, bias=False)
+        self.to_out = nn.Sequential(
+            nn.Conv2d(hidden_dim, dim, kernel_size=1),
+            nn.GroupNorm(1, dim)
+        )
+    
+    def forward(self, x):
+        b,c,h,w = x.shape
+        # (b,hidden_dim,h,w) -> (b,hidden_dim*3, h, w)
+        qkv = self.to_qkv(x).chunk(3, dim=1)
+        q, k, v = map(
+            lambda t: rearrange("b (h d) x y -> b h d (x y)",h=self.num_heads), qkv
+        )
+
+        q = q.softmax(dim=-2)
+        k = k.softmax(dim=-1)
+
+        q = q * self.scale
+
+        # 这里采取不同的处理复杂度会不同,主要的复杂度在最后一维
+        context = einsum(" b h d n, b h e n -> b h d e",k,v)
+        
+        out = einsum("b h d n, b h d e -> b h e n", q,context)
+        out = rearrange(out, "b h d (x y) -> b (h d) x y ",x=h,y=w)
+        return self.to_out
+
+class PreNorm(nn.Module):
+    def __init__(self, fn ,dim):
+        self.fn = fn
+        self.norm = nn.LayerNorm(dim)
+    
+    def forward(self, x, **kwargs):
+        return self.fn(self.norm(x), **kwargs)
+    
