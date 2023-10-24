@@ -12,15 +12,15 @@ batch_size = 128
 channels = 1
 img_size = 28
 
-dataset = torchvision.datasets.FashionMNIST(
+train_dataset = torchvision.datasets.FashionMNIST(
     root='./data',
     train=True,
-    transform=transforms,
+    transform=transform,
     download=True
 )
 
 train_loader = DataLoader(
-    dataset=dataset,
+    dataset=train_dataset,
     batch_size=batch_size,
     shuffle=True
 )

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from parameters import *
+from tqdm import tqdm
 
 # forward diffusion
 def q_sample(x_start, t, noise=None):
@@ -31,7 +32,7 @@ def pixel_loss(denoise_model, x_start, t, noise=None, loss_type='l1'):
     return loss
 
     
-# reverse sample
+# sample
 @torch.no_grad()
 def p_sample(denoise_model, x, t, t_idx):
     betas_t = extract(betas, t, x.shape)
@@ -42,7 +43,7 @@ def p_sample(denoise_model, x, t, t_idx):
         x - betas_t/ sqrt_one_minus_alphas_cumprod_t * denoise_model(x,t)
     )
     
-    if t_idx == 0: #这一步没懂
+    if t_idx == 0: #最后一步不再去噪
         return model_mean
     else:
         betas_hat_t = extract(betas_hat, t, x.shape)
@@ -50,5 +51,21 @@ def p_sample(denoise_model, x, t, t_idx):
         
         return model_mean + torch.sqrt(betas_hat_t) * noise
 
+@torch.no_grad()
 def p_sample_loop(denoise_model, shape):
     device = next(denoise_model.parameters()).device
+
+    b = shape[0]
+
+    # start from random noise
+    imgs = []
+    img = torch.randn(shape, device=device)
+    for i in tqdm(reversed(range(0, timesteps))):
+        img = p_sample(denoise_model, img, torch.full((b,), i, device=device), i)
+        imgs.append(img.cpu().numpy()) #转换成numpy，方便之后转换成Image格式
+    
+    return imgs
+
+@torch.no_grad()
+def sample(denoise_model, img_size, batch_size=16, channels=3):
+    return p_sample_loop(denoise_model, shape=(batch_size, channels, img_size, img_size))

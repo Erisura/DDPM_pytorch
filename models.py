@@ -53,7 +53,7 @@ class SinusoidalPositionEmbedding(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim, dim_out, num_groups=8):
         super().__init__()
-        self.proj = nn.Conv2d(dim,dim_out, kernel_size=3,padding=1)
+        self.proj = nn.Conv2d(dim, dim_out, kernel_size=3,padding=1)
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=dim_out)
         self.act = nn.SiLU()
     def forward(self, x, scale_shift=None):
@@ -109,7 +109,7 @@ class ConvNeXtBlock(nn.Module):
             nn.Conv2d(dim, dim_out * mult, kernel_size=3, padding=1),
             nn.GELU(),
             nn.GroupNorm(1, dim_out * mult),
-            nn.Conv2d(dim_out * mult, dim_out,kernal_size=3,padding=1),
+            nn.Conv2d(dim_out * mult, dim_out,kernel_size=3,padding=1),
         )
         self.res_conv = nn.Conv2d(dim, dim_out, kernel_size=1) if not dim==dim_out else nn.Identity()
     
@@ -168,7 +168,7 @@ class LinearAttention(nn.Module):
         # (b,hidden_dim,h,w) -> (b,hidden_dim*3, h, w)
         qkv = self.to_qkv(x).chunk(3, dim=1)
         q, k, v = map(
-            lambda t: rearrange("b (h d) x y -> b h d (x y)",h=self.num_heads), qkv
+            lambda t: rearrange(t, "b (h d) x y -> b h d (x y)",h=self.num_heads), qkv
         )
 
         q = q.softmax(dim=-2)
@@ -181,16 +181,16 @@ class LinearAttention(nn.Module):
         
         out = einsum("b h d n, b h d e -> b h e n", q,context)
         out = rearrange(out, "b h d (x y) -> b (h d) x y ",x=h,y=w)
-        return self.to_out
+        return self.to_out(out)
 
 class PreNorm(nn.Module):
     def __init__(self, dim ,fn):
         super().__init__()
         self.fn = fn
-        self.norm = nn.LayerNorm(dim)
+        self.norm = nn.GroupNorm(1, dim)
     
-    def forward(self, x, **kwargs):
-        return self.fn(self.norm(x), **kwargs)
+    def forward(self, x):
+        return self.fn(self.norm(x))
 
 """
     首先，对噪声图像进行卷积处理，对噪声水平进行进行位置编码（embedding）
@@ -223,7 +223,7 @@ class UNet(nn.Module):
         dims = [init_dim, *map(lambda t: dim*t, dim_mults)]
         
         # 巧妙地将dim序列打包成 等同于in = dim[k], out = dim[k+1]
-        in_out = list(zip(dims[:-1],dim[1:]))
+        in_out = list(zip(dims[:-1],dims[1:]))
 
         if use_convnext:
             block_klass = partial(ConvNeXtBlock,mult=convnext_mult)
@@ -250,7 +250,7 @@ class UNet(nn.Module):
 
         # 定义UNet下采样部分
         for idx, (dim_in, dim_out) in enumerate(in_out):
-            is_last = idx == len(in_out-1)
+            is_last = idx == len(in_out)-1
 
             self.downs.append(
                 nn.ModuleList([
@@ -297,14 +297,12 @@ class UNet(nn.Module):
             x = block1(x, t)
             x = block2(x, t)
             x = atten(x)
-
             h.append(x)
             x = downsample(x)
-
         # bottle neck
-            x = self.mid_block1(x, t)
-            x = self.mid_atten(x)
-            x = self.mid_block2(x, t)
+        x = self.mid_block1(x, t)
+        x = self.mid_atten(x)
+        x = self.mid_block2(x, t)
 
         # upsample
         for block1, block2, atten, upsample in self.ups:
