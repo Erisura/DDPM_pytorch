@@ -1,2 +1,2 @@
 # DDPM_pytorch
-a implementation of DDPM in pytorch
+an implementation of DDPM in pytorch
